@@ -1,180 +1,126 @@
-"""Predicted_KT_V
+"""
+Hemodialysis Adequacy Prediction (Kt/V) — SAINT Training and Inference Script
+============================================================================
 
-Outcome prediction model (F1): predicts PD adequacy metrics such as Kt/V from structured
-tabular inputs.
+This script contains the end-to-end pipeline used in our study to train a SAINT-based
+tabular model for predicting Kt/V (dialysis adequacy) from structured clinical data.
 
-This file is intended to be a single, self-contained script that:
-- Loads a study CSV
-- Preprocesses discrete/continuous features (imputation + scaling)
-- Trains a SAINT-like transformer model for regression
-- Evaluates on a held-out split and produces diagnostic plots
-- Saves a PyTorch checkpoint and (optionally) feature-importance outputs
+It includes:
+- Data preprocessing (imputation, scaling, feature selection).
+- SAINT model definition (mixed discrete/continuous features).
+- Training loop and evaluation utilities.
+- Visualization routines for performance and permutation-based feature importance.
+- A lightweight inference helper for loading a trained checkpoint and producing
+  predictions on new data using the saved feature configuration.
 
-Assumptions
-- You have a local CSV file with the same column names used during the study.
-- Any paths, column lists, or hyperparameters are configured inside `main()`.
+Reproducibility
+---------------
+To reproduce results reported in the manuscript, ensure the same:
+1) data schema (column names and types),
+2) preprocessing configuration (`feature_info.pkl`),
+3) random seeds (if set by the caller/environment),
+4) library versions (PyTorch / scikit-learn / pandas).
 
-Open-source tips
-- Do not commit private datasets. Use `.gitignore` for `data/` and `checkpoints/`.
-- Provide a small demo CSV (synthetic or anonymized) so others can run end-to-end.
-
+License
+-------
+Add your project license here (e.g., MIT, Apache-2.0) when publishing on GitHub.
 """
 
 import torch
+
 import torch.nn as nn
+
 import torch.optim as optim
+
 import matplotlib.pyplot as plt
+
 import pandas as pd
+
 import numpy as np
+
 import seaborn as sns
+
 import pickle
+
 from sklearn.preprocessing import StandardScaler
+
 from sklearn.model_selection import GroupShuffleSplit
+
 from sklearn.impute import SimpleImputer
+
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
 
 
-# ==================== Data preprocessing ====================
 def preprocess_data(data):
-    """Preprocess a raw pandas DataFrame into model-ready tensors.
+    """Preprocess the raw tabular dataset for SAINT training/inference.
 
-    Steps
-    - Select discrete and continuous feature columns
-    - Impute missing values
-    - Standardize continuous features
-    - Build torch tensors for training
+    This function performs median imputation for missing values and standardizes
+    continuous features using a fitted `StandardScaler`. Non-feature identifier or
+    label columns are excluded as specified by `exclude_columns` in the code.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Input dataframe containing clinical variables and targets.
 
     Returns
-    - X: torch.FloatTensor, shape (N, D)
-    - y: torch.FloatTensor, shape (N, 1)
-    - preprocessors used (imputer/scaler) when the function fits them
+    -------
+    X : numpy.ndarray
+        Model input matrix after imputation and scaling.
+    y : numpy.ndarray
+        Target vector used for supervised training (as defined in the code).
+    feature_names : list[str]
+        Names of the columns used as model inputs (saved for reproducibility).
+    scaler : sklearn.preprocessing.StandardScaler
+        Fitted scaler used for continuous feature normalization.
     """
-    data = data.copy()
+    imputer = SimpleImputer(strategy='median')
 
-    if "PatientID" in data.columns:
-        data["PatientID"] = data["PatientID"].astype(str)
+    exclude_columns = ['記錄時間', 'PatientID', 'RRF Kt/V', 'total Kt/V',
+                       'Kt/V', 'Kt/V (Gotch)', 'Kt/V (Daugirdas)',
+                       'URR', 'week total Kt/V', 'week Kt/V']  # 部分column屬於label或不參與訓練
+    feature_columns = [col for col in data.columns if col not in exclude_columns]
 
-    discrete_features = [
-        "Gender",
-        "HBsAg",
-        "Anti-HCV",
-        "Comorbidities",
-        "Dialysis_method",
-        "Anticoagulant",
-        "Base",
-        "Dialyzer_model",
-    ]
-    continuous_features = [
-        "Age",
-        "Height",
-        "Weight",
-        "BSA",
-        "BP_systolic",
-        "BP_diastolic",
-        "BUN_pre",
-        "BUN_post",
-        "Creatinine",
-        "Albumin",
-        "Total_protein",
-        "Hemoglobin",
-        "Hematocrit",
-        "WBC",
-        "Platelet",
-        "Sodium",
-        "Potassium",
-        "Calcium",
-        "Phosphorus",
-        "Chloride",
-        "Bicarbonate",
-        "Dialysis_time",
-        "Blood_flow_rate",
-        "Dialysate_flow_rate",
-        "UF_volume",
-        "KtV_Gotch",
-        "URR",
-    ]
+    X = data[feature_columns].values
+    y = data['Kt/V'].values
 
-    target_column = "PD_KtV"
-
-    for col in discrete_features + continuous_features + [target_column]:
-        if col not in data.columns:
-            data[col] = np.nan
-
-    def to_numeric_safely(series):
-        return pd.to_numeric(series, errors="coerce")
-
-    for col in continuous_features + [target_column]:
-        data[col] = to_numeric_safely(data[col])
-
-    for col in discrete_features:
-        data[col] = data[col].astype(str).fillna("nan")
-
-    X_discrete = data[discrete_features].copy()
-    X_cont = data[continuous_features].copy()
-    y = data[[target_column]].copy()
-
-    cont_imputer = SimpleImputer(strategy="median")
-    X_cont_imputed = cont_imputer.fit_transform(X_cont)
+    X_imputed = imputer.fit_transform(X)
 
     scaler = StandardScaler()
-    X_cont_scaled = scaler.fit_transform(X_cont_imputed)
+    X_scaled = scaler.fit_transform(X_imputed)
 
-    def encode_discrete_df(df):
-        encoded = []
-        encoders = {}
-        for col in df.columns:
-            categories = sorted(df[col].astype(str).unique().tolist())
-            mapping = {c: i for i, c in enumerate(categories)}
-            encoders[col] = mapping
-            encoded.append(df[col].astype(str).map(mapping).fillna(0).astype(int).values.reshape(-1, 1))
-        return np.concatenate(encoded, axis=1), encoders
+    feature_names = feature_columns
 
-    X_disc_encoded, disc_encoders = encode_discrete_df(X_discrete)
+    with open('feature_names.pkl', 'wb') as f:
+        pickle.dump(feature_names, f)
 
-    X = np.concatenate([X_disc_encoded.astype(np.float32), X_cont_scaled.astype(np.float32)], axis=1)
-
-    y_imputer = SimpleImputer(strategy="median")
-    y_imputed = y_imputer.fit_transform(y).astype(np.float32)
-
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(y_imputed, dtype=torch.float32)
-
-    preprocessors = {
-        "discrete_features": discrete_features,
-        "continuous_features": continuous_features,
-        "target_column": target_column,
-        "disc_encoders": disc_encoders,
-        "cont_imputer": cont_imputer,
-        "cont_scaler": scaler,
-        "y_imputer": y_imputer,
-        "num_discrete": len(discrete_features),
-        "num_continuous": len(continuous_features),
-    }
-    return X_tensor, y_tensor, preprocessors
+    return X_scaled, y, feature_names, scaler
 
 
-# ==================== Model definition ====================
 class SAINT(nn.Module):
-    """SAINT-style transformer model for mixed discrete/continuous tabular features.
+    """SAINT model for tabular learning on mixed discrete/continuous features.
 
-    High-level architecture
-    - Discrete features -> embeddings
-    - Continuous features -> linear projection
-    - Concatenate into a sequence and encode with TransformerEncoder layers
-    - Pool and regress to a single output
+    This implementation follows a transformer-style encoder for tabular data, where
+    each feature is treated as a token. Discrete and continuous features are
+    embedded separately and then fused before passing through stacked multi-head
+    self-attention layers.
+
+    Notes
+    -----
+    - The exact feature indexing and tensor shapes are governed by
+      `discrete_feature_indices` and `continuous_feature_indices`.
+    - Training/evaluation behavior (e.g., dropout) depends on `model.train()` vs
+      `model.eval()` states controlled by the caller.
     """
 
-    def __init__(
-        self,
-        input_size,
-        hidden_size,
-        output_size,
-        discrete_feature_indices,
-        continuous_feature_indices,
-        num_heads=8,
-        num_layers=6,
-        dropout=0.1,
-    ):
+    def __init__(self, input_size, hidden_size, output_size,
+                 discrete_feature_indices, continuous_feature_indices,
+                 num_heads=8, num_layers=6, dropout=0.1):
+        """Initialize SAINT modules and projection heads.
+
+        The constructor builds embeddings/projections and the transformer encoder stack
+        according to the provided feature partition and hyperparameters.
+        """
         super(SAINT, self).__init__()
 
         self.hidden_size = hidden_size
@@ -184,247 +130,268 @@ class SAINT(nn.Module):
         self.num_discrete = len(discrete_feature_indices)
         self.num_continuous = len(continuous_feature_indices)
 
-        self.discrete_embeddings = nn.ModuleList(
-            [nn.Embedding(num_embeddings=1000, embedding_dim=hidden_size) for _ in range(self.num_discrete)]
-        )
+        self.discrete_embedding = nn.Embedding(100, hidden_size)
 
-        self.continuous_projection = nn.Linear(self.num_continuous, hidden_size)
+        self.continuous_projection = nn.Linear(1, hidden_size)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=hidden_size * 4,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.feature_fusion = nn.Linear(hidden_size, hidden_size)
 
-        self.fc_out = nn.Sequential(
-            nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, hidden_size // 2),
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size,
+                                                   nhead=num_heads,
+                                                   dropout=dropout,
+                                                   batch_first=True)
+
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer,
+                                                         num_layers=num_layers)
+
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, output_size),
+            nn.Linear(hidden_size, output_size)
         )
 
     def forward(self, x):
+        """Forward pass.
+
+        Converts the raw input matrix into discrete/continuous token embeddings,
+        applies the transformer encoder, and produces the final regression output.
+        """
         batch_size = x.size(0)
 
-        discrete_parts = []
-        for i, idx in enumerate(self.discrete_feature_indices):
-            xi = x[:, idx].long().clamp(min=0)
-            discrete_parts.append(self.discrete_embeddings[i](xi).unsqueeze(1))
+        discrete_features = x[:, self.discrete_feature_indices].long()
+        continuous_features = x[:, self.continuous_feature_indices].float()
 
-        disc_tokens = torch.cat(discrete_parts, dim=1) if len(discrete_parts) > 0 else None
+        discrete_embedded = self.discrete_embedding(discrete_features)
 
-        cont_x = x[:, self.continuous_feature_indices]
-        cont_token = self.continuous_projection(cont_x).unsqueeze(1)
+        continuous_features = continuous_features.unsqueeze(-1)
+        continuous_embedded = self.continuous_projection(continuous_features)
 
-        if disc_tokens is None:
-            tokens = cont_token
-        else:
-            tokens = torch.cat([disc_tokens, cont_token], dim=1)
+        all_features = torch.cat([discrete_embedded, continuous_embedded], dim=1)
 
-        encoded = self.transformer(tokens)
-        pooled = encoded.mean(dim=1)
+        fused_features = self.feature_fusion(all_features)
 
-        out = self.fc_out(pooled)
-        return out
+        transformed = self.transformer_encoder(fused_features)
+
+        pooled = transformed.mean(dim=1)
+
+        output = self.output_layer(pooled)
+
+        return output
+
+    def get_feature_importance(self, X, feature_names, device='cpu'):
+        """Estimate feature importance via permutation on a held-out matrix.
+
+        For each feature, the column is randomly permuted and the corresponding
+        performance degradation is used as an importance proxy.
+        """
+        self.eval()
+        X_tensor = torch.FloatTensor(X).to(device)
+
+        baseline_predictions = self(X_tensor).detach().cpu().numpy().flatten()
+
+        feature_importances = []
+        for i in range(X.shape[1]):
+            X_permuted = X.copy()
+            np.random.shuffle(X_permuted[:, i])
+
+            X_permuted_tensor = torch.FloatTensor(X_permuted).to(device)
+            permuted_predictions = self(X_permuted_tensor).detach().cpu().numpy().flatten()
+
+            importance = np.mean(np.abs(baseline_predictions - permuted_predictions))
+            feature_importances.append(importance)
+
+        return np.array(feature_importances)
 
 
-# ==================== Evaluation utilities ====================
-def evaluate_model(model, data_loader, device="cpu"):
-    """Evaluate a trained model on a DataLoader.
-
-    Returns a dictionary with common regression metrics (MSE, RMSE, MAE, R2, MAPE when available).
-    """
+def evaluate_model(model, X_test, y_test):
+    """Compute standard regression metrics for a trained model on a test set."""
     model.eval()
-    y_true_list = []
-    y_pred_list = []
+
+    X_test_tensor = torch.FloatTensor(X_test)
+    y_test_tensor = torch.FloatTensor(y_test)
 
     with torch.no_grad():
-        for X_batch, y_batch in data_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-            preds = model(X_batch)
-            y_true_list.append(y_batch.cpu().numpy())
-            y_pred_list.append(preds.cpu().numpy())
+        predictions = model(X_test_tensor).numpy().flatten()
 
-    y_true = np.concatenate(y_true_list, axis=0).reshape(-1)
-    y_pred = np.concatenate(y_pred_list, axis=0).reshape(-1)
+    mse = mean_squared_error(y_test, predictions)
+    mae = mean_absolute_error(y_test, predictions)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, predictions)
+    mape = mean_absolute_percentage_error(y_test, predictions)
 
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = float(np.sqrt(mse))
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
+    print(f"Test MSE: {mse:.4f}")
+    print(f"Test MAE: {mae:.4f}")
+    print(f"Test RMSE: {rmse:.4f}")
+    print(f"Test R²: {r2:.4f}")
+    print(f"Test MAPE: {mape:.4f}")
 
-    metrics = {"mse": mse, "rmse": rmse, "mae": mae, "r2": r2}
-    try:
-        metrics["mape"] = mean_absolute_percentage_error(y_true, y_pred)
-    except Exception:
-        pass
-
-    return metrics, y_true, y_pred
+    return predictions
 
 
-def visualize_results(y_true, y_pred, save_prefix="f1"):
-    """Create diagnostic plots (e.g., y_true vs y_pred, residuals) for reporting and sanity checks."""
-    plt.figure()
-    plt.scatter(y_true, y_pred, alpha=0.4)
-    plt.xlabel("True")
-    plt.ylabel("Predicted")
-    plt.title("True vs Predicted")
+def visualize_results(ground_truth, predictions, threshold=1.7):
+    """Visualize prediction performance and threshold-based pass/fail grouping."""
+    plt.figure(figsize=(10, 6))
+    plt.scatter(ground_truth, predictions, alpha=0.5)
+    plt.plot([ground_truth.min(), ground_truth.max()],
+             [ground_truth.min(), ground_truth.max()],
+             '--', linewidth=2)
+    plt.xlabel("Ground Truth Kt/V")
+    plt.ylabel("Predicted Kt/V")
+    plt.title("Ground Truth vs Predicted Kt/V")
+    plt.grid(True)
+    plt.show()
+
+    ground_truth_pass = ground_truth >= threshold
+    predictions_pass = predictions >= threshold
+
+    accuracy = np.mean(ground_truth_pass == predictions_pass)
+    print(f"Threshold-based accuracy (Kt/V >= {threshold}): {accuracy:.4f}")
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(predictions[ground_truth_pass], bins=30, alpha=0.7, label='Ground Truth PASS')
+    plt.hist(predictions[~ground_truth_pass], bins=30, alpha=0.7, label='Ground Truth FAIL')
+    plt.axvline(threshold, linestyle='--', linewidth=2)
+    plt.xlabel("Predicted Kt/V")
+    plt.ylabel("Frequency")
+    plt.title("Predicted Kt/V Distribution by Ground Truth PASS/FAIL")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def visualize_feature_importance(feature_importances, feature_names, top_n=30):
+    """Plot the top-N permutation feature importances."""
+    indices = np.argsort(feature_importances)[::-1][:top_n]
+    top_features = [feature_names[i] for i in indices]
+    top_importances = feature_importances[indices]
+
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x=top_importances, y=top_features)
+    plt.xlabel("Permutation Importance (Mean |Δ Prediction|)")
+    plt.ylabel("Feature")
+    plt.title(f"Top {top_n} Feature Importances")
     plt.tight_layout()
-    plt.savefig(f"{save_prefix}_true_vs_pred.png")
-    plt.close()
-
-    residuals = y_true - y_pred
-    plt.figure()
-    plt.hist(residuals, bins=50)
-    plt.xlabel("Residual (true - pred)")
-    plt.ylabel("Count")
-    plt.title("Residual distribution")
-    plt.tight_layout()
-    plt.savefig(f"{save_prefix}_residuals.png")
-    plt.close()
+    plt.show()
 
 
-def visualize_feature_importance(feature_names, importances, save_path="feature_importance.png"):
-    """Compute and save/plot feature-importance estimates.
+def predict_with_model(model_path, data_df, feature_info_path='feature_info.pkl'):
+    """Load a saved SAINT checkpoint and run prediction on a provided dataframe.
 
-    Important: document the method (e.g., permutation importance) in your paper/repo.
+    This function is intended for reproducible inference using the same feature
+    configuration saved during training (`feature_info.pkl`).
     """
-    df = pd.DataFrame({"feature": feature_names, "importance": importances})
-    df = df.sort_values("importance", ascending=False).head(30)
-
-    plt.figure(figsize=(10, 8))
-    sns.barplot(data=df, x="importance", y="feature")
-    plt.title("Top feature importances")
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-    return df
-
-
-# ==================== Inference utility ====================
-def predict_with_model(model_path, feature_info_path, csv_path, device="cpu"):
-    """Load a saved model + preprocessing artifacts and run inference on a CSV.
-
-    Returns a NumPy array of predictions.
-    """
-    with open(feature_info_path, "rb") as f:
+    with open(feature_info_path, 'rb') as f:
         feature_info = pickle.load(f)
 
-    df = pd.read_csv(csv_path)
-    X_tensor, _, preprocessors = preprocess_data(df)
+    feature_names = feature_info['feature_names']
+    scaler = feature_info['scaler']
+    discrete_feature_indices = feature_info['discrete_feature_indices']
+    continuous_feature_indices = feature_info['continuous_feature_indices']
+    hidden_size = feature_info['hidden_size']
+    output_size = feature_info['output_size']
 
-    num_discrete = preprocessors["num_discrete"]
-    num_continuous = preprocessors["num_continuous"]
-    discrete_feature_indices = list(range(num_discrete))
-    continuous_feature_indices = list(range(num_discrete, num_discrete + num_continuous))
+    X = data_df[feature_names].values
 
-    hidden_size = feature_info.get("hidden_size", 128)
+    imputer = SimpleImputer(strategy='median')
+    X_imputed = imputer.fit_transform(X)
 
-    model = SAINT(
-        input_size=X_tensor.shape[1],
-        hidden_size=hidden_size,
-        output_size=1,
-        discrete_feature_indices=discrete_feature_indices,
-        continuous_feature_indices=continuous_feature_indices,
-    ).to(device)
+    X_scaled = scaler.transform(X_imputed)
 
-    state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state, strict=False)
+    input_size = X_scaled.shape[1]
+    model = SAINT(input_size=input_size,
+                  hidden_size=hidden_size,
+                  output_size=output_size,
+                  discrete_feature_indices=discrete_feature_indices,
+                  continuous_feature_indices=continuous_feature_indices)
+
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
     model.eval()
 
+    X_tensor = torch.FloatTensor(X_scaled)
     with torch.no_grad():
-        preds = model(X_tensor.to(device)).cpu().numpy().reshape(-1)
-    return preds
+        predictions = model(X_tensor).numpy().flatten()
+
+    return predictions
 
 
-# ==================== Training entrypoint ====================
 def main():
-    """Run the full training pipeline.
+    """Entry point for model training, evaluation, and artifact generation."""
+    data_path = 'your_data.csv'
+    data = pd.read_csv(data_path)
 
-    Edit the configuration inside this function to match your dataset paths and column names.
-    """
-    csv_path = "your_training_data.csv"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    X, y, feature_names, scaler = preprocess_data(data)
 
-    df = pd.read_csv(csv_path)
+    discrete_feature_indices = []
+    continuous_feature_indices = list(range(X.shape[1]))
 
-    X_tensor, y_tensor, preprocessors = preprocess_data(df)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    groups = data['PatientID'].values
+    train_idx, test_idx = next(gss.split(X, y, groups=groups))
 
-    num_discrete = preprocessors["num_discrete"]
-    num_continuous = preprocessors["num_continuous"]
-    discrete_feature_indices = list(range(num_discrete))
-    continuous_feature_indices = list(range(num_discrete, num_discrete + num_continuous))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
-    dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+    input_size = X_train.shape[1]
+    hidden_size = 64
+    output_size = 1
 
-    if "PatientID" in df.columns:
-        groups = df["PatientID"].astype(str).values
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        train_idx, test_idx = next(gss.split(np.arange(len(df)), groups=groups))
-    else:
-        idx = np.arange(len(df))
-        np.random.seed(42)
-        np.random.shuffle(idx)
-        split = int(0.8 * len(idx))
-        train_idx, test_idx = idx[:split], idx[split:]
+    model = SAINT(input_size=input_size,
+                  hidden_size=hidden_size,
+                  output_size=output_size,
+                  discrete_feature_indices=discrete_feature_indices,
+                  continuous_feature_indices=continuous_feature_indices)
 
-    train_set = torch.utils.data.Subset(dataset, train_idx.tolist())
-    test_set = torch.utils.data.Subset(dataset, test_idx.tolist())
-
-    train_loader = torch.utils.data.DataLoader(train_set, batch_size=64, shuffle=True, drop_last=False)
-    test_loader = torch.utils.data.DataLoader(test_set, batch_size=256, shuffle=False, drop_last=False)
-
-    model = SAINT(
-        input_size=X_tensor.shape[1],
-        hidden_size=128,
-        output_size=1,
-        discrete_feature_indices=discrete_feature_indices,
-        continuous_feature_indices=continuous_feature_indices,
-        num_heads=8,
-        num_layers=4,
-        dropout=0.1,
-    ).to(device)
-
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    epochs = 30
-    for epoch in range(1, epochs + 1):
+    num_epochs = 50
+    batch_size = 32
+
+    for epoch in range(num_epochs):
         model.train()
-        total_loss = 0.0
-        n_batches = 0
 
-        for Xb, yb in train_loader:
-            Xb = Xb.to(device)
-            yb = yb.to(device)
+        permutation = np.random.permutation(X_train.shape[0])
+        X_train_shuffled = X_train[permutation]
+        y_train_shuffled = y_train[permutation]
+
+        epoch_loss = 0.0
+        for i in range(0, X_train.shape[0], batch_size):
+            X_batch = X_train_shuffled[i:i + batch_size]
+            y_batch = y_train_shuffled[i:i + batch_size]
+
+            X_batch_tensor = torch.FloatTensor(X_batch)
+            y_batch_tensor = torch.FloatTensor(y_batch).view(-1, 1)
 
             optimizer.zero_grad()
-            preds = model(Xb)
-            loss = criterion(preds, yb)
+            outputs = model(X_batch_tensor)
+            loss = criterion(outputs, y_batch_tensor)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            n_batches += 1
+            epoch_loss += loss.item()
 
-        avg_loss = total_loss / max(1, n_batches)
-        print(f"[Epoch {epoch:03d}] train_loss={avg_loss:.6f}")
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss:.4f}")
 
-    metrics, y_true, y_pred = evaluate_model(model, test_loader, device=device)
-    print("=== Test metrics ===")
-    for k, v in metrics.items():
-        print(f"{k}: {v}")
+    predictions = evaluate_model(model, X_test, y_test)
+    visualize_results(y_test, predictions, threshold=1.7)
 
-    visualize_results(y_true, y_pred, save_prefix="f1")
+    feature_importances = model.get_feature_importance(X_test, feature_names)
+    visualize_feature_importance(feature_importances, feature_names, top_n=30)
 
-    torch.save(model.state_dict(), "saint_pd_model.pth")
-    print("Saved model checkpoint to: saint_pd_model.pth")
+    model_save_path = 'saint_model.pth'
+    torch.save(model.state_dict(), model_save_path)
+
+    feature_info = {
+        'feature_names': feature_names,
+        'scaler': scaler,
+        'discrete_feature_indices': discrete_feature_indices,
+        'continuous_feature_indices': continuous_feature_indices,
+        'hidden_size': hidden_size,
+        'output_size': output_size
+    }
+    with open('feature_info.pkl', 'wb') as f:
+        pickle.dump(feature_info, f)
 
 
 if __name__ == "__main__":
